@@ -10,14 +10,33 @@ const SHIFT_META = {
   O: { label: '휴무', color: '#E5E7EB', defaultHours: 0 },
 };
 
+// 2026 rates. Update these values only after checking the official sources in README.md.
+const PAYROLL_2026 = {
+  minimumHourly: 10320,
+  employee: {
+    pension: 0.0475,
+    healthAndLongTermCare: 0.040674,
+    employment: 0.009,
+  },
+};
+
 const defaultState = {
-  rate: 10500,
+  rate: PAYROLL_2026.minimumHourly,
   month: new Date().getMonth(),
   year: new Date().getFullYear(),
   activeTab: 'today',
   pattern: [],
   patternStart: '',
   entries: {},
+  includeWeeklyHoliday: false,
+  weeklyContractHours: 15,
+  completedWeeks: 0,
+  includeInsurance: false,
+  insurance: {
+    pension: true,
+    healthAndLongTermCare: true,
+    employment: true,
+  },
 };
 
 let state = structuredClone(defaultState);
@@ -26,10 +45,16 @@ let selectedDate = '';
 async function loadState() {
   try {
     const saved = await Storage.getItem(APP_KEY);
-    if (saved) state = { ...state, ...JSON.parse(saved) };
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      state = { ...state, ...parsed, insurance: { ...defaultState.insurance, ...parsed.insurance } };
+    }
   } catch (_) {
     const saved = localStorage.getItem(APP_KEY);
-    if (saved) state = { ...state, ...JSON.parse(saved) };
+    if (saved) {
+      const parsed = JSON.parse(saved);
+      state = { ...state, ...parsed, insurance: { ...defaultState.insurance, ...parsed.insurance } };
+    }
   }
 }
 
@@ -66,6 +91,21 @@ function getEntry(key) {
   return state.entries[key] || getPatternEntry(key);
 }
 
+function getWeeklyHolidayHours() {
+  if (!state.includeWeeklyHoliday || Number(state.weeklyContractHours) < 15) return 0;
+  const weeklyHours = Math.min(Number(state.weeklyContractHours), 40);
+  return (weeklyHours / 40) * 8 * Number(state.completedWeeks || 0);
+}
+
+function getInsuranceDeduction(gross) {
+  if (!state.includeInsurance) return { total: 0, pension: 0, healthAndLongTermCare: 0, employment: 0 };
+  const insurance = state.insurance || defaultState.insurance;
+  const pension = insurance.pension ? gross * PAYROLL_2026.employee.pension : 0;
+  const healthAndLongTermCare = insurance.healthAndLongTermCare ? gross * PAYROLL_2026.employee.healthAndLongTermCare : 0;
+  const employment = insurance.employment ? gross * PAYROLL_2026.employee.employment : 0;
+  return { total: pension + healthAndLongTermCare + employment, pension, healthAndLongTermCare, employment };
+}
+
 function getMonthSummary(year = state.year, month = state.month) {
   const days = new Date(year, month + 1, 0).getDate();
   let hours = 0;
@@ -79,11 +119,20 @@ function getMonthSummary(year = state.year, month = state.month) {
       if (entry.type === 'N') nights += 1;
     }
   }
-  return { hours, shifts, nights, estimate: hours * Number(state.rate || 0) };
+  const basePay = hours * Number(state.rate || 0);
+  const weeklyHolidayHours = getWeeklyHolidayHours();
+  const weeklyHolidayPay = weeklyHolidayHours * Number(state.rate || 0);
+  const gross = basePay + weeklyHolidayPay;
+  const insurance = getInsuranceDeduction(gross);
+  return { hours, shifts, nights, basePay, weeklyHolidayHours, weeklyHolidayPay, gross, insurance, net: gross - insurance.total };
 }
 
 function currency(value) {
   return `${Math.round(value).toLocaleString('ko-KR')}원`;
+}
+
+function percent(value) {
+  return `${(value * 100).toFixed(value * 100 % 1 ? 4 : 2)}%`;
 }
 
 function render() {
@@ -140,10 +189,10 @@ function renderToday() {
       <div class="summary-grid">
         ${summaryTile('총 근무', `${summary.hours}시간`)}
         ${summaryTile('근무일', `${summary.shifts}일`)}
-        ${summaryTile('예상 급여', currency(summary.estimate), 'wide')}
+        ${summaryTile('예상 실수령액', currency(summary.net), 'wide')}
       </div>
     </section>
-    <section class="tip-card"><span>i</span><p>예상 급여는 입력한 시급과 근무시간으로 계산해요. 실제 지급액과 공제액은 계약 조건에 따라 달라질 수 있어요.</p></section>
+    <section class="tip-card"><span>i</span><p>주휴수당과 4대보험은 설정에서 직접 적용할 수 있어요. 실제 지급액과 공제액은 계약 조건, 보수월액과 사업장 신고 내용에 따라 달라질 수 있어요.</p></section>
   `;
 }
 
@@ -190,19 +239,22 @@ function renderPay() {
   const rate = Number(state.rate || 0);
   return `
     <section class="pay-hero">
-      <p>${state.month + 1}월 예상 급여</p>
-      <h2>${currency(summary.estimate)}</h2>
+      <p>${state.month + 1}월 예상 실수령액</p>
+      <h2>${currency(summary.net)}</h2>
       <span>시급 ${currency(rate)} · 총 ${summary.hours}시간</span>
     </section>
     <section class="section-block">
-      <div class="section-title"><h2>계산 기준</h2><button class="text-button" data-action="settings">수정</button></div>
+      <div class="section-title"><h2>계산 내역</h2><button class="text-button" data-action="settings">수정</button></div>
       <div class="detail-list">
         <div><span>기본 시급</span><strong>${currency(rate)}</strong></div>
         <div><span>등록된 근무일</span><strong>${summary.shifts}일</strong></div>
-        <div><span>야간 근무</span><strong>${summary.nights}일</strong></div>
+        <div><span>기본 급여</span><strong>${currency(summary.basePay)}</strong></div>
+        <div><span>주휴수당 ${state.includeWeeklyHoliday ? `(${summary.weeklyHolidayHours.toFixed(1)}시간)` : '(미포함)'}</span><strong>${currency(summary.weeklyHolidayPay)}</strong></div>
+        <div><span>예상 세전 급여</span><strong>${currency(summary.gross)}</strong></div>
+        <div><span>4대보험 공제</span><strong>-${currency(summary.insurance.total)}</strong></div>
       </div>
     </section>
-    <section class="tip-card"><span>!</span><p>주휴수당, 야간·휴일 가산, 세금 공제는 근무 계약과 사업장 조건에 따라 달라요. 이 화면은 기본 시급 기준의 예상값입니다.</p></section>
+    <section class="tip-card"><span>!</span><p>주휴수당은 주 15시간 이상, 해당 주의 소정근로일 개근 등 조건을 충족한 경우에만 발생해요. 산재보험은 근로자 공제 항목이 아니라 사업주 부담이라 실수령액에서 빼지 않습니다.</p></section>
   `;
 }
 
@@ -263,15 +315,45 @@ function openShiftModal(key) {
 
 function openSettingsModal() {
   openModal(`
-    <div class="modal-head"><div><p>급여 계산 기준</p><h2>시급 설정</h2></div><button class="icon-button" data-action="close-modal">×</button></div>
+    <div class="modal-head"><div><p>급여 계산 기준</p><h2>시급 · 주휴 · 보험</h2></div><button class="icon-button" data-action="close-modal">×</button></div>
     <label class="field-label">기본 시급<input id="rate-input" type="number" min="0" step="100" value="${state.rate}" inputmode="numeric" /></label>
-    <p class="field-help">야간·휴일 수당, 주휴수당, 세금·공제는 초기 버전에 포함하지 않았어요.</p>
+    <p class="field-help">2026년 최저임금은 시간당 ${currency(PAYROLL_2026.minimumHourly)}입니다.</p>
+    <section class="setting-section">
+      <div class="toggle-row"><div><strong>주휴수당 포함</strong><p>조건을 충족한 주만 반영하세요.</p></div><input id="weekly-toggle" type="checkbox" ${state.includeWeeklyHoliday ? 'checked' : ''} /></div>
+      <div class="two-fields">
+        <label class="field-label">주 소정근로시간<input id="weekly-hours-input" type="number" min="0" max="40" step="0.5" value="${state.weeklyContractHours}" /></label>
+        <label class="field-label">개근한 주 수<input id="completed-weeks-input" type="number" min="0" max="5" step="1" value="${state.completedWeeks}" /></label>
+      </div>
+    </section>
+    <section class="setting-section">
+      <div class="toggle-row"><div><strong>4대보험 공제 포함</strong><p>근로자 부담분만 예상 공제합니다.</p></div><input id="insurance-toggle" type="checkbox" ${state.includeInsurance ? 'checked' : ''} /></div>
+      <div class="insurance-options">
+        ${insuranceOption('pension', '국민연금', percent(PAYROLL_2026.employee.pension), state.insurance.pension)}
+        ${insuranceOption('healthAndLongTermCare', '건강보험·장기요양', percent(PAYROLL_2026.employee.healthAndLongTermCare), state.insurance.healthAndLongTermCare)}
+        ${insuranceOption('employment', '고용보험', percent(PAYROLL_2026.employee.employment), state.insurance.employment)}
+        <p>산재보험은 사업주 전액 부담이라 근로자 공제에는 포함하지 않습니다.</p>
+      </div>
+    </section>
+    <p class="field-help">이 계산은 예상 급여를 보험료 산정 기준으로 단순 적용합니다. 실제 보험 가입 여부·보수월액·비과세 항목·세금은 급여명세서와 다를 수 있어요.</p>
     <button class="primary-button" id="save-rate">저장</button>
   `);
   document.querySelector('#save-rate').addEventListener('click', async () => {
     state.rate = Number(document.querySelector('#rate-input').value || 0);
+    state.includeWeeklyHoliday = document.querySelector('#weekly-toggle').checked;
+    state.weeklyContractHours = Number(document.querySelector('#weekly-hours-input').value || 0);
+    state.completedWeeks = Number(document.querySelector('#completed-weeks-input').value || 0);
+    state.includeInsurance = document.querySelector('#insurance-toggle').checked;
+    state.insurance = {
+      pension: document.querySelector('#insurance-pension').checked,
+      healthAndLongTermCare: document.querySelector('#insurance-healthAndLongTermCare').checked,
+      employment: document.querySelector('#insurance-employment').checked,
+    };
     await saveState(); closeModal(); render();
   });
+}
+
+function insuranceOption(key, label, rate, checked) {
+  return `<label class="check-row"><span>${label}<small>근로자 ${rate}</small></span><input id="insurance-${key}" type="checkbox" ${checked ? 'checked' : ''} /></label>`;
 }
 
 function openPatternModal() {
